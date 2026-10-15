@@ -1,0 +1,11 @@
+*.env
+.env
+*.key
+*.pem
+LAB
+LAB.pub
+id_*
+*.sql
+*.sql.gz
+*.tar
+backups/
