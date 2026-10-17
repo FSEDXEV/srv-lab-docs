@@ -1,6 +1,6 @@
 # Laboratorio srv-lab: procedimiento paso a paso (AlmaLinux 9, Podman y GLPI)
 
-Última actualización: 14 de octubre de 2026
+Última actualización: 17 de octubre de 2026
 
 ## Objetivo y alcance
 
@@ -47,6 +47,8 @@ El laboratorio es una cadena de piezas pequeñas, cada una con un trabajo. Esta 
 | dnf-automatic | Servicio que instala solo las actualizaciones de seguridad | Mantiene el servidor parcheado sin intervención. No reinicia por su cuenta, para que los servicios no se caigan de repente | Actualizar a mano cada semana |
 | Bitwarden | Gestor de contraseñas en la nube, con cifrado | Guarda contraseñas largas y únicas (router, GLPI, Cockpit, GitHub) y solo necesitas recordar la maestra | KeePassXC (archivo local), Proton Pass |
 | Git y GitHub | Git guarda el historial de cambios de los archivos; GitHub aloja los repositorios en internet | Versionar la documentación y las configuraciones. El repositorio público muestra tu trabajo a reclutadores y el privado guarda lo funcional | GitLab, Forgejo (autoalojado) |
+| Temporizadores de systemd | Archivos que le dicen a systemd cuándo ejecutar un servicio, como un despertador con una tarea | Lanzan la copia de seguridad de GLPI a las 23:00 y el apagado del servidor a las 23:30 | cron, más antiguo y sin el registro integrado de systemd |
+| rtcwake y Wake-on-LAN | rtcwake programa una alarma en el reloj de la placa para encender el equipo; Wake-on-LAN lo enciende con un mensaje por la red | El servidor se enciende solo a las 06:00. Encenderlo desde el celular falta por activar en la BIOS | Un enchufe programable, que apaga en seco sin cerrar el sistema |
 
 ### Por instalar
 
@@ -82,6 +84,21 @@ Cómo averiguar la RAM máxima de cualquier equipo:
 3. Buscar el modelo exacto en la ficha del fabricante y comparar con el límite del procesador (Intel ARK o AMD).
 
 El máximo real es el menor entre procesador, placa y sistema operativo.
+
+**Comprobación de la memoria desde el servidor (17 de octubre de 2026).** `dmidecode` es una herramienta que lee los datos que la placa informa a la BIOS; solo lee, no cambia nada. No estaba instalada.
+
+```bash
+sudo dnf install -y dmidecode
+sudo dmidecode -t baseboard
+sudo dmidecode -t 16
+sudo dmidecode -t memory
+```
+
+- `-t baseboard` mostró la placa: ASUS P8H61-M LX2.
+- `-t 16` mostró 2 ranuras y una capacidad máxima de 32 GiB. Es una cifra genérica de la BIOS; el límite que vale es el de la ficha de ASUS, 16 GB con módulos de 8 GB.
+- `-t memory` mostró la ranura DIMM0 con un módulo de 4 GB DDR3 a 1333 MT/s y la ranura DIMM1 vacía.
+- **Decisión:** comprar un solo módulo de 8 GB, DDR3 de escritorio, 1333 MT/s y 1,5 V, y ponerlo en DIMM1. Con el de 4 GB quedan 12 GB. Los módulos de distinto tamaño funcionan juntos.
+- **Si el módulo es de segunda:** pasar memtest86+ una pasada completa antes de usarlo.
 
 ## Preparación de la BIOS
 
@@ -646,7 +663,7 @@ Se desactiva en lugar de borrar para que sea reversible y no se pierda el histor
 
 Una copia de GLPI necesita dos piezas, la base de datos y el volumen de datos, y debe guardarse también fuera del servidor; un respaldo en el mismo disco no protege si el disco falla.
 
-Estado: **ejecutado y probado el 14 de octubre de 2026.** La base de datos se restauró en un contenedor temporal y mostró los 6 usuarios con su estado correcto. El volumen de archivos está respaldado y verificado (contiene `config/glpicrypt.key`), pero su restauración todavía no se probó.
+Estado: **ejecutado y probado el 14 de octubre de 2026.** La base de datos se restauró en un contenedor temporal y mostró los 6 usuarios con su estado correcto. El volumen de archivos está respaldado y verificado (contiene `config/glpicrypt.key`); el 17 de octubre de 2026 también se probó importarlo en un volumen de prueba.
 
 **Hacer la copia** (como `fabian`):
 
@@ -666,6 +683,125 @@ tar -tf ~/backups/glpi/glpi-data-$(date +%F).tar | grep glpicrypt
 - `podman volume ls` muestra el nombre real del volumen de datos; aquí es `systemd-glpi-data`.
 - El volumen de datos guarda la configuración de GLPI, incluida su clave de cifrado. Sin ella, la copia de la base de datos no sirve para recuperar las contraseñas que GLPI guarda cifradas. Por eso hacen falta **los dos archivos**.
 - `chmod 600` deja los archivos legibles solo por tu usuario. Resultado esperado: un `.tar` de unos 3,8 MB y un `.sql.gz` de unos 130 KB.
+
+**Copia automática diaria (hecho el 15 de octubre de 2026).** Una copia que hay que acordarse de hacer a mano termina por olvidarse. Se automatiza con dos piezas: un *script* (un archivo de texto con los comandos de la copia, uno detrás de otro) y un *temporizador* de systemd que lo ejecuta solo todos los días a las 23:00 y conserva 14 días de copias.
+
+**Paso 1: crear el script** (como `fabian`). Se guarda en `~/bin`, una carpeta para tus propios programas.
+
+```
+mkdir -p ~/bin
+nano ~/bin/backup-glpi.sh
+chmod 700 ~/bin/backup-glpi.sh
+```
+
+`nano` es un editor de texto de terminal: pega el contenido de abajo, guarda con `Ctrl + O` y `Enter`, y sal con `Ctrl + X`. `chmod 700` lo deja ejecutable y solo para tu usuario.
+
+```
+#!/bin/bash
+# Copia de seguridad de GLPI: base de datos + volumen de datos.
+# Guarda en ~/backups/glpi y borra las copias de mas de 14 dias.
+set -euo pipefail
+umask 077
+
+DEST="$HOME/backups/glpi"
+FECHA=$(date +%F)
+DIAS=14
+
+mkdir -p "$DEST"
+rm -f "$DEST/.db.tmp" "$DEST/.data.tmp"
+
+# 1. Base de datos (comprimida), primero a un archivo temporal
+podman exec glpi-db sh -c 'mariadb-dump -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" --single-transaction --no-tablespaces "$MARIADB_DATABASE"' | gzip > "$DEST/.db.tmp"
+gzip -t "$DEST/.db.tmp"
+[ "$(stat -c%s "$DEST/.db.tmp")" -gt 10000 ] || { echo "ERROR: la copia de la base de datos es demasiado pequena"; exit 1; }
+mv "$DEST/.db.tmp" "$DEST/glpi-db-$FECHA.sql.gz"
+
+# 2. Volumen de archivos y configuracion (incluye la clave de cifrado)
+podman volume export systemd-glpi-data -o "$DEST/.data.tmp"
+tar -tf "$DEST/.data.tmp" > /dev/null
+mv "$DEST/.data.tmp" "$DEST/glpi-data-$FECHA.tar"
+
+chmod 600 "$DEST"/glpi-*
+# 3. Borrar copias de mas de $DIAS dias
+find "$DEST" -maxdepth 1 -name 'glpi-*' -mtime +"$DIAS" -delete
+
+echo "Copia $FECHA correcta"
+```
+
+- `set -euo pipefail` hace que el script se detenga ante el primer error, para que nunca dé por buena una copia incompleta.
+- `umask 077` deja privados los archivos nuevos. El `chmod 600` final hace falta igual, porque `podman volume export` ignora el umask y dejaba el `.tar` legible por todos (permisos 644).
+- Cada copia se escribe primero en un archivo temporal (`.db.tmp`, `.data.tmp`) y solo se renombra si pasa las comprobaciones: `gzip -t` prueba el comprimido, la base debe pesar más de 10 000 bytes y `tar -tf` debe poder listar el volumen. Así una copia dañada nunca reemplaza a una buena.
+- `find ... -mtime +"$DIAS" -delete` borra las copias de más de 14 días; el número está en `DIAS=14`.
+
+**Paso 2: crear el servicio y el temporizador** (también como `fabian`, sin `sudo`). Systemd separa *qué* se ejecuta (el servicio) de *cuándo* (el temporizador). Van en `~/.config/systemd/user/`, la carpeta de systemd para tu usuario, la misma de los archivos Quadlet de GLPI.
+
+```
+mkdir -p ~/.config/systemd/user
+nano ~/.config/systemd/user/glpi-backup.service
+nano ~/.config/systemd/user/glpi-backup.timer
+```
+
+Contenido de `glpi-backup.service`:
+
+```
+[Unit]
+Description=Copia de seguridad de GLPI (base de datos y volumen)
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/backup-glpi.sh
+```
+
+Contenido de `glpi-backup.timer`:
+
+```
+[Unit]
+Description=Copia de seguridad diaria de GLPI a las 23:00
+
+[Timer]
+OnCalendar=*-*-* 23:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Actívalo:
+
+```
+systemctl --user daemon-reload
+systemctl --user enable --now glpi-backup.timer
+systemctl --user list-timers --no-pager
+```
+
+- `Type=oneshot` significa que el servicio se ejecuta una vez y termina. `%h` es tu carpeta personal.
+- `Persistent=true`: si el servidor estaba apagado a las 23:00, la copia se hace al encender.
+- `enable --now` lo activa ahora y en cada arranque. `list-timers` debe mostrar la próxima ejecución (columna NEXT) a las 23:00.
+- Funciona sin que haya una sesión abierta porque tu usuario tiene *linger* activado, lo mismo que hace arrancar GLPI solo. Compruébalo con `loginctl show-user fabian | grep Linger`: debe decir `Linger=yes`.
+- La copia tarda segundos, así que termina mucho antes del apagado de las 23:30.
+
+**Paso 3: comprobar.** La primera vez conviene lanzarla a mano y ver el resultado:
+
+```
+~/bin/backup-glpi.sh
+ls -l --time-style=long-iso ~/backups/glpi
+systemctl --user status glpi-backup.service --no-pager
+```
+
+Resultado correcto: `Copia AAAA-MM-DD correcta` y dos archivos nuevos con permisos `-rw-------`. La noche del 15 de octubre de 2026 las copias aparecieron solas a las 23:00.
+
+**Ver los registros.** `journalctl --user -u glpi-backup.service` puede responder `No journal files were found`. El registro (journal) de este servidor era volátil, se borraba en cada reinicio, y ahora el servidor se reinicia cada noche. Se hizo persistente con:
+
+```
+sudo mkdir -p /var/log/journal
+sudo systemctl restart systemd-journald
+```
+
+Para los servicios de usuario también sirve `journalctl _SYSTEMD_USER_UNIT=glpi-backup.service --no-pager`. Si la pantalla se queda congelada con un `:` o `(END)` abajo, es el paginador `less`: pulsa `q`. Con `--no-pager` no aparece.
+
+**Seguridad de las copias.** El `.tar` contiene `config/glpicrypt.key`, `config/config_db.php` (datos de conexión a la base de datos) y las llaves `oauth.pem` y `oauth.pub`. Mantén los permisos en 600, no las subas a Git (el `.gitignore` lo evita) y, si las sacas de casa, que sea cifradas.
+
+**Límite actual.** Todas las copias están en el mismo SSD que el servidor: protegen contra un borrado o una actualización fallida, pero no contra la falla del disco. Sacarlas a otro equipo sigue siendo manual (bloque anterior) y está en la lista de pendientes.
 
 **Sacar la copia del servidor** (desde el portátil, PowerShell):
 
@@ -689,6 +825,66 @@ podman rm -fv test-restore
 
 Cambia `FECHA` por la de tu archivo. Resultado correcto: la consulta lista los 6 usuarios, con `Fabian` y `glpi-system` en 1 y los otros cuatro en 0. `podman rm -fv` borra la base temporal y su volumen.
 
+**Probar también el volumen de archivos, con una copia nueva (hecho el 17 de octubre de 2026).** La prueba anterior solo comprobó la base de datos. Esta repite la base con una copia hecha ese mismo día (que ya incluye tu usuario administrador propio) y además comprueba que el volumen de archivos se puede importar. Todo ocurre en un contenedor y un volumen de prueba, sin tocar GLPI.
+
+**Paso 1: hacer una copia nueva y comprobar que está sana.**
+
+```
+~/bin/backup-glpi.sh
+FECHA=$(date +%F)
+ls -l --time-style=long-iso ~/backups/glpi/*$FECHA*
+gzip -t ~/backups/glpi/glpi-db-$FECHA.sql.gz && echo "BD comprimida OK"
+tar -tf ~/backups/glpi/glpi-data-$FECHA.tar | head -5
+```
+
+Resultado esperado: `Copia AAAA-MM-DD correcta`, los dos archivos con `-rw-------`, `BD comprimida OK` y, en la lista del tar, `config/`, `config/config_db.php`, `config/glpicrypt.key` y las llaves `oauth`.
+
+**Paso 2: crear una base de datos temporal.**
+
+```
+IMG=$(podman inspect glpi-db --format '{{.ImageName}}')
+podman run -d --name restore-test-db -e MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=1 -e MARIADB_DATABASE=glpi_test $IMG --innodb-buffer-pool-size=64M --max-connections=10
+until podman logs restore-test-db 2>&1 | grep -q "init process done"; do sleep 2; done
+until podman exec restore-test-db mariadb -uroot -e "SELECT 1" >/dev/null 2>&1; do sleep 2; done
+echo "BD de prueba lista"
+```
+
+- La primera línea toma el nombre de la imagen de tu base de datos real, para probar con la misma versión de MariaDB.
+- `MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=1` deja la base sin contraseña. Es aceptable solo aquí, porque no se publica ningún puerto (no lleva `-p`), solo se alcanza con `podman exec` desde tu usuario y se borra a los pocos minutos.
+- `--innodb-buffer-pool-size=64M --max-connections=10` limitan la memoria; el servidor tiene 4 GB y GLPI sigue corriendo.
+- Los dos `until` esperan a que MariaDB termine de arrancar. En el primer arranque se reinicia sola una vez, y importar antes puede fallar. Si pasan más de 2 minutos, pulsa `Ctrl + C` y revisa `podman logs restore-test-db`.
+
+**Paso 3: restaurar la base y revisarla.**
+
+```
+zcat ~/backups/glpi/glpi-db-$FECHA.sql.gz | podman exec -i restore-test-db mariadb -uroot glpi_test
+podman exec restore-test-db mariadb -uroot glpi_test -e "SELECT COUNT(*) AS tablas FROM information_schema.tables WHERE table_schema='glpi_test'; SELECT name, is_active FROM glpi_users ORDER BY name;"
+```
+
+Resultado correcto (17 de octubre de 2026): 442 tablas y los 6 usuarios, con `Fabian` y `glpi-system` en 1 y `glpi`, `normal`, `post-only` y `tech` en 0. Es lo mismo que muestra GLPI en Administración → Usuarios.
+
+**Paso 4: restaurar el volumen de archivos.** Es el proceso inverso al de la copia.
+
+```
+podman volume create restore-test-data
+podman volume import restore-test-data ~/backups/glpi/glpi-data-$FECHA.tar
+podman run --rm --entrypoint ls -v restore-test-data:/v:ro $IMG -la /v
+```
+
+Resultado correcto: aparecen las carpetas `config`, `files`, `logs` y `marketplace`, con dueño `www-data` (el usuario con el que corre GLPI dentro de su contenedor). `--entrypoint ls` cambia el programa de arranque de la imagen por `ls`, solo para listar, y `:ro` monta el volumen en solo lectura.
+
+**Paso 5: limpiar.**
+
+```
+podman rm -f restore-test-db
+podman volume rm restore-test-data
+podman ps
+```
+
+`podman ps` debe mostrar solo `glpi` y `glpi-db`: el servidor queda como estaba.
+
+**Qué no cubre esta prueba.** No arrancó una segunda copia de GLPI con estos datos, ni se probó la restauración real sobre producción: el bloque «Restaurar de verdad» sigue sin probarse en producción.
+
 **Restaurar de verdad** (solo en una emergencia; esta variante aún no se ha probado en producción):
 
 ```
@@ -708,6 +904,367 @@ Problemas frecuentes:
 - El archivo de la base de datos pesa 0 bytes: falló el comando; revisa que `glpi-db` esté en marcha y que las variables `MARIADB_USER` y `MARIADB_PASSWORD` existan dentro del contenedor (`cut -d= -f1 ~/lab/glpi/db.env` lista los nombres sin mostrar las claves).
 - `scp: Could not resolve hostname c`: el comando de Windows se ejecutó dentro del servidor. Sal con `exit` y vuelve a ejecutarlo en el portátil. Si se creó una carpeta de nombre raro en el servidor, bórrala con `rmdir ~/'C:UsersUSUARIObackups-srv-lab'`.
 - La copia de seguridad contiene contraseñas y claves: trátala como un secreto, no la subas a repositorios ni a nubes públicas.
+
+## Git y GitHub: versionar la documentación y las configuraciones
+
+Estado: **ejecutado el 15 de octubre de 2026.** Hay dos repositorios en GitHub, uno público con la documentación y otro privado con las configuraciones funcionales del servidor.
+
+**Qué es cada cosa.** Git es un programa que se instala en tu portátil y guarda el historial de cambios de tus archivos: quién cambió qué, cuándo y por qué. GitHub es el sitio web donde se publica ese historial. Con Git puedes volver a una versión anterior si algo sale mal; con GitHub tienes una copia fuera de tu casa y una vitrina que un reclutador puede abrir.
+
+**Por qué dos repositorios.** Lo que se muestra al mundo y lo que describe cómo está armado tu servidor no deben mezclarse.
+
+| Repositorio | Visibilidad | Qué contiene | Qué nunca contiene |
+| --- | --- | --- | --- |
+| `srv-lab-docs` | Público | README y la guía del laboratorio, ya revisada | Contraseñas, llaves, correos, direcciones MAC |
+| `srv-lab-privado` | Privado | Archivos Quadlet, scripts y su README | Contraseñas, archivos `.env`, llaves, copias de seguridad |
+
+**Paso 1: instalar Git** (en el portátil, con PowerShell, no dentro de `ssh srv-lab`).
+
+```
+git --version
+winget install --id Git.Git -e --source winget
+```
+
+- El primer comando comprueba si ya está instalado. Si responde con un número de versión, omite el segundo.
+- `winget` instala desde el almacén oficial de Microsoft. Si pide aceptar los términos de la fuente, escribe `Y`.
+- Al terminar, **cierra PowerShell y ábrelo de nuevo**. La ventana vieja no se entera del programa nuevo.
+- Resultado esperado: `git version 2.xx.x.windows.x`.
+
+**Paso 2: decirle a Git quién eres.** Cada cambio queda firmado con un nombre y un correo. Como el repositorio público lo puede ver cualquiera, se usa el correo privado de GitHub (`noreply`) y no tu correo real.
+
+1. En GitHub: foto de perfil → **Settings** → **Emails**. Activa **Keep my email addresses private** y **Block command line pushes that expose my email**.
+2. Copia la dirección `noreply` que aparece, con la forma `NUMERO+USUARIO@users.noreply.github.com`.
+3. En PowerShell, cambia los valores de ejemplo por los tuyos:
+
+```
+git config --global user.name "Tu Nombre"
+git config --global user.email "NUMERO+USUARIO@users.noreply.github.com"
+git config --global init.defaultBranch main
+git config --global --list
+```
+
+- Los comandos de configuración no muestran nada; el último lista lo guardado.
+- `init.defaultBranch main` hace que la rama principal se llame `main`, el nombre estándar de GitHub.
+
+**Paso 3: crear una llave SSH solo para GitHub.** Con la llave, GitHub sabe que eres tú sin pedir contraseña. Es **distinta** de la llave `LAB` del servidor: si una se filtra, la otra sigue segura.
+
+```
+ssh-keygen -t ed25519 -C "github-usuario" -f $HOME\.ssh\github_ed25519
+```
+
+- `-t ed25519` es el tipo de llave, moderno y seguro. `-C` es una etiqueta para reconocerla. `-f` es el nombre del archivo, para no pisar otras llaves.
+- Pide una **passphrase**: una contraseña que protege el archivo por si alguien lo copia. Al escribirla no se ve nada; es normal. Se pide dos veces. Guárdala en el gestor de contraseñas.
+- Se crean dos archivos: `github_ed25519` (la **privada**, no se comparte con nadie) y `github_ed25519.pub` (la **pública**, la que va a GitHub).
+- Para comprobar si quedó con passphrase: `ssh-keygen -y -f $HOME\.ssh\github_ed25519`. Si pide la passphrase, la tiene; imprime la llave pública.
+
+**Paso 4: registrar la llave pública en GitHub.**
+
+```
+Get-Content $HOME\.ssh\github_ed25519.pub | Set-Clipboard
+```
+
+1. El comando copia la llave pública al portapapeles (no muestra nada).
+2. En GitHub: foto → **Settings** → **SSH and GPG keys** → **New SSH key**.
+3. **Title:** el nombre del equipo (por ejemplo `Portatil`). **Key type:** `Authentication Key`. **Key:** pega con `Ctrl + V` (empieza con `ssh-ed25519`).
+4. **Add SSH key** y confirma con tu contraseña o con el 2FA si lo pide.
+
+**Paso 5: probar la conexión y dejarla permanente.**
+
+```
+ssh -i $HOME\.ssh\github_ed25519 -T git@github.com
+```
+
+- La primera vez pregunta `Are you sure you want to continue connecting?`. Comprueba que la huella sea `SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU` (la publica GitHub en su documentación) y escribe `yes`.
+- Respuesta correcta: `Hi USUARIO! You've successfully authenticated, but GitHub does not provide shell access.` No es un error: GitHub no da terminal, solo confirma quién eres.
+
+Sin el `-i`, SSH no encuentra la llave porque solo prueba nombres estándar como `id_ed25519`. Se arregla una vez con una nota en el archivo de configuración (**ejecútalo una sola vez**, o quedará el bloque duplicado):
+
+```
+Add-Content $HOME\.ssh\config "`nHost github.com`n  HostName github.com`n  User git`n  IdentityFile ~/.ssh/github_ed25519`n  IdentitiesOnly yes"
+ssh -T git@github.com
+```
+
+Desde ahora SSH usa esa llave solo con github.com, y la llave `LAB` sigue siendo la del servidor.
+
+**Paso 6: crear los repositorios** (en la web: **+** arriba a la derecha → **New repository**).
+
+- `srv-lab-docs`: visibilidad **Public**, con **Add README** activado.
+- `srv-lab-privado`: visibilidad **Private** (verifica este campo antes de crear), con **Add README** activado.
+- Deja sin marcar **.gitignore** y **license**; el `.gitignore` se crea a mano en el paso 8.
+
+**Paso 7: clonar** (descargar una copia del repositorio a tu portátil, conectada con el original).
+
+```
+New-Item -ItemType Directory -Force $HOME\proyectos
+cd $HOME\proyectos
+git clone git@github.com:USUARIO/srv-lab-docs.git
+git clone git@github.com:USUARIO/srv-lab-privado.git
+```
+
+Cada clonación pide la passphrase de la llave. Resultado esperado: `Cloning into ...` y una carpeta con `README.md`.
+
+**Paso 8: crear el `.gitignore`.** Es la lista de archivos que Git nunca debe subir, y la red de seguridad contra subir una llave o una copia de seguridad por accidente. Se crea dentro de cada repositorio:
+
+```
+@"
+*.env
+.env
+*.key
+*.pem
+LAB
+LAB.pub
+id_*
+*.sql
+*.sql.gz
+*.tar
+backups/
+"@ | Set-Content .gitignore
+```
+
+**Paso 9: preparar el contenido.** Antes de publicar algo en el repositorio público se revisa buscando datos sensibles. En la copia pública de esta guía se aplicaron estos cambios:
+
+- La dirección MAC se reemplazó por `00:14:d1:xx:xx:xx`.
+- La contraseña de prueba del ejemplo de restauración se reemplazó por `CLAVE_DE_PRUEBA`.
+- El diagrama no se exporta a Markdown; se reemplazó por una línea que lo describe.
+
+Para el repositorio privado, antes de copiar los archivos de Quadlet se contaron coincidencias de las palabras `pass`, `secret`, `token` y `key` sin mostrar su contenido (`grep -c -i -E "pass|secret|token|key" archivos`); todos dieron `0`. Los archivos `.container` solo apuntan a los `.env` por su ruta (`EnvironmentFile=%h/lab/glpi/db.env`), por eso pueden subirse sin secretos. Se trajeron con:
+
+```
+scp "srv-lab:.config/containers/systemd/*" $HOME\proyectos\srv-lab-privado\quadlet\
+```
+
+**Paso 10: guardar y subir los cambios.** Git trabaja en etapas: preparas qué cambios entran (`add`), tomas la "foto" con un mensaje (`commit`) y la envías a GitHub (`push`).
+
+```
+git status
+git add .
+git status
+git commit -m "Describe qué cambió"
+git push
+```
+
+- El primer `git status` muestra en rojo lo que cambió. Después de `git add .`, debe verse en verde. **Revisa esa lista antes de confirmar:** si aparece un `.env`, un `.sql`, un `.tar` o una llave, no sigas.
+- Los avisos `LF will be replaced by CRLF` son normales en Windows: Git solo ajusta los saltos de línea.
+- `git push` pide la passphrase y termina con `main -> main`.
+
+**Paso 11: verificar en el navegador.** Abre `https://github.com/USUARIO/srv-lab-docs`: debe verse el README y la carpeta `docs`. En `srv-lab-privado` debe verse la carpeta `quadlet` y el candado con la etiqueta **Private**.
+
+**Ciclo de trabajo.** Cada vez que cambie la guía o un archivo: exportar la guía y limpiarla de datos sensibles, copiarla a la carpeta del repositorio y repetir el paso 10. La copia pública de la guía es una foto del día en que se exportó; no se actualiza sola.
+
+**Reglas de seguridad de los repositorios:**
+
+1. Nunca se suben contraseñas, llaves privadas, archivos `.env`, copias de seguridad ni bases de datos.
+2. Siempre se revisa `git status` en verde antes de hacer `commit`.
+3. El repositorio público solo contiene lo que no te importaría que lea cualquiera, incluido un empleador.
+4. Se activa la verificación en dos pasos de GitHub y los códigos de recuperación se guardan en el gestor de contraseñas.
+5. Si algún secreto llega a subirse, no basta con borrarlo en un commit nuevo: queda en el historial. Hay que cambiar esa contraseña o llave de inmediato.
+
+Problemas frecuentes de esta sección:
+
+- `git : El término 'git' no se reconoce`: no está instalado o la ventana de PowerShell es anterior a la instalación. Instálalo y abre una ventana nueva.
+- `Permission denied (publickey)`: SSH no usó la llave o GitHub no la tiene. Prueba con `ssh -i $HOME\.ssh\github_ed25519 -T git@github.com`; si funciona, falta la nota del archivo `config` (paso 5); si no, revisa en GitHub que la llave pública esté guardada (paso 4).
+- `fatal: Could not read from remote repository`: la misma causa de arriba, o el nombre del repositorio está mal escrito.
+- La passphrase se pide en cada operación: es esperado. Se puede evitar con el agente de SSH de Windows, pero es una mejora opcional.
+- El archivo de configuración tiene el bloque `Host github.com` repetido: ábrelo con `notepad $HOME\.ssh\config` y borra uno de los dos, sin tocar el bloque de `srv-lab`.
+
+## Apagado nocturno y encendido programado
+
+Estado: **ejecutado el 15 de octubre de 2026 y comprobado la noche siguiente.** El servidor se apaga solo a las 23:30 y se enciende solo a las 06:00; en la primera noche real arrancó a las 06:00:20 del 16 de octubre.
+
+El laboratorio no necesita estar encendido de madrugada, y apagarlo ahorra electricidad y desgaste. El horario de cada noche queda así: 23:00 copia de seguridad, 23:30 apagado (con un aviso de 60 segundos) y 06:00 encendido.
+
+**Cómo se enciende un equipo apagado.** La placa tiene su propio reloj, el *RTC* (reloj de tiempo real), que sigue funcionando aunque el servidor esté apagado. El comando `rtcwake` programa una alarma en ese reloj y apaga el equipo; cuando suena la alarma, la placa enciende el servidor. Esta placa lo hizo sin cambiar nada en la BIOS.
+
+El RTC guarda la hora en UTC, cinco horas por delante de Colombia. Por eso el registro dice `11:00:00` cuando la alarma es a las 06:00 de aquí. No es un error.
+
+**Paso 1: crear el script** (con `sudo`, porque apagar el equipo exige permisos de administrador). Se guarda en `/usr/local/sbin`, la carpeta para programas de administración propios.
+
+```
+sudo nano /usr/local/sbin/apagar-con-alarma.sh
+sudo chmod 755 /usr/local/sbin/apagar-con-alarma.sh
+```
+
+Contenido del script:
+
+```
+#!/bin/bash
+# Apaga el servidor y programa su encendido a las 06:00 con la alarma del reloj (RTC).
+set -euo pipefail
+
+SALTAR=/home/fabian/no-apagar
+HORA=06:00
+
+AHORA=$(date +%s)
+OBJETIVO=$(date -d "$HORA" +%s)
+if [ "$OBJETIVO" -le "$AHORA" ]; then
+  OBJETIVO=$(date -d "tomorrow $HORA" +%s)
+fi
+
+echo "Encendido programado para: $(date -d @"$OBJETIVO" '+%F %T')"
+
+if [ "${1:-}" = "--prueba" ]; then
+  echo "Modo prueba: no se apaga nada."
+  exit 0
+fi
+
+if [ -e "$SALTAR" ]; then
+  rm -f "$SALTAR"
+  echo "Apagado omitido esta noche (existia $SALTAR)."
+  exit 0
+fi
+
+wall "srv-lab se apaga en 60 segundos por horario. Para cancelar: sudo systemctl stop apagado-nocturno.service"
+sleep 60
+exec /usr/sbin/rtcwake -m off -t "$OBJETIVO"
+```
+
+- Calcula la próxima 06:00: si la de hoy ya pasó, usa la de mañana.
+- Con `--prueba` solo muestra cuándo encendería, sin apagar nada.
+- Si existe el archivo `/home/fabian/no-apagar`, se salta el apagado esa noche y borra el archivo, así que solo vale una vez.
+- `wall` manda un aviso a todas las sesiones abiertas y `sleep 60` deja un minuto para cancelar.
+- `exec rtcwake -m off -t ...` deja la alarma puesta y apaga el equipo.
+
+**Paso 2: probar sin apagar nada.**
+
+```
+sudo /usr/local/sbin/apagar-con-alarma.sh --prueba
+```
+
+Debe responder `Encendido programado para: AAAA-MM-DD 06:00:00` y `Modo prueba: no se apaga nada.`
+
+**Paso 3: probar que la alarma funciona de verdad.** Antes de fiarse del horario real se hizo una prueba corta, con una alarma a 3 minutos. El servidor se apaga en el acto y tiene que encenderse solo:
+
+```
+sudo rtcwake -m off -s 180
+```
+
+El servidor se encendió solo a los 3 minutos: `last reboot` mostró un arranque a las 22:49, tras apagarse a las 22:46. Si no se enciende en unos 5 minutos, pulsa el botón de encendido.
+
+**Paso 4: crear el servicio y el temporizador** (con `sudo`, en `/etc/systemd/system/`, porque son del sistema y no de tu usuario; la copia de seguridad va en tu usuario porque Podman corre sin permisos de administrador).
+
+```
+sudo nano /etc/systemd/system/apagado-nocturno.service
+sudo nano /etc/systemd/system/apagado-nocturno.timer
+```
+
+Contenido de `apagado-nocturno.service`:
+
+```
+[Unit]
+Description=Apagado nocturno con encendido programado
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/apagar-con-alarma.sh
+```
+
+Contenido de `apagado-nocturno.timer`:
+
+```
+[Unit]
+Description=Apagado nocturno a las 23:30
+
+[Timer]
+OnCalendar=*-*-* 23:30:00
+
+[Install]
+WantedBy=timers.target
+```
+
+Actívalo:
+
+```
+sudo systemctl daemon-reload
+sudo systemctl enable --now apagado-nocturno.timer
+systemctl list-timers apagado-nocturno.timer --no-pager
+```
+
+Este temporizador no lleva `Persistent=true`, a diferencia del de la copia: si el servidor estaba apagado a las 23:30, no debe apagarse apenas se encienda.
+
+**Paso 5: comprobar a la mañana siguiente.**
+
+```
+uptime -s
+last reboot | head -3
+journalctl -u apagado-nocturno.service --no-pager | tail -5
+ls -l --time-style=long-iso ~/backups/glpi
+```
+
+Resultado del 16 de octubre de 2026: `uptime -s` dio `2026-10-16 06:00:20`; el registro mostró `Encendido programado para: 2026-10-16 06:00:00` y `rtcwake: wakeup from "off" using /dev/rtc0 at Fri Oct 16 11:00:00 2026` (esa hora está en UTC); y la copia de las 23:00 estaba en su carpeta.
+
+**Controlar el apagado:**
+
+- Saltarse una noche: `touch ~/no-apagar`. El script borra el archivo después de usarlo.
+- Cancelar durante el aviso de 60 segundos: `sudo systemctl stop apagado-nocturno.service`.
+- Desactivar el horario: `sudo systemctl disable --now apagado-nocturno.timer`.
+- Cambiar las horas: edita `HORA` en el script y `OnCalendar` en el temporizador; después `sudo systemctl daemon-reload` y `sudo systemctl restart apagado-nocturno.timer`.
+- Apagarlo a mano durante el día y que se encienda a las 06:00 del día siguiente: `sudo /usr/local/sbin/apagar-con-alarma.sh` (sin `--prueba`). Un apagado normal, por Cockpit o con `poweroff`, no programa ninguna alarma: el servidor queda apagado hasta que pulses el botón o uses Wake-on-LAN.
+
+Problemas frecuentes:
+
+- El servidor no se encendió a las 06:00: pulsa el botón de encendido y mira `last reboot` y `journalctl -u apagado-nocturno.service --no-pager | tail -5`. Si el registro muestra la línea `rtcwake: wakeup from "off"`, la alarma sí se programó y el fallo está en el equipo o en la BIOS; revísala la próxima vez que conectes un monitor.
+- El registro muestra la hora cinco horas adelantada: es el RTC, que trabaja en UTC. La hora de Colombia es UTC menos 5.
+- La terminal se queda con `(END)` o `:` al final: es el paginador; pulsa `q`.
+
+## Wake-on-LAN y control desde el celular
+
+Estado: **configurado en el sistema el 15 de octubre de 2026; la primera prueba desde el celular falló y falta revisar la BIOS.** El servidor ya se enciende solo a las 06:00 (sección anterior); esto añade poder encenderlo a cualquier hora desde el celular, dentro de la red de casa.
+
+**Qué es.** Wake-on-LAN (WoL) enciende un equipo apagado con un «paquete mágico»: un mensaje por la red local que lleva la dirección MAC del equipo repetida 16 veces. La tarjeta de red lo escucha aunque el servidor esté apagado. Para eso hacen falta tres cosas: que la placa le siga dando corriente, que el sistema operativo deje la función activada y que la BIOS permita encender por esa tarjeta. Solo funciona dentro de la red de casa. No hay que abrir ningún puerto del router para esto; para encenderlo desde fuera se usaría una VPN, más adelante.
+
+**Paso 1: ver el estado de la tarjeta** (en el servidor).
+
+```
+sudo ethtool enp5s0 | grep Wake-on
+```
+
+`Wake-on: d` significa desactivado y `Wake-on: g` significa activado con paquete mágico. Al principio estaba en `d`.
+
+**Paso 2: activarlo.** Se usan dos comandos: uno para ahora y otro para que no se pierda al reiniciar.
+
+```
+sudo ethtool -s enp5s0 wol g
+sudo nmcli connection modify enp5s0 802-3-ethernet.wake-on-lan magic
+nmcli -g 802-3-ethernet.wake-on-lan connection show enp5s0
+```
+
+- `ethtool -s ... wol g` cambia la tarjeta de inmediato, pero el cambio se pierde al reiniciar.
+- `nmcli connection modify` guarda el ajuste en NetworkManager, que lo aplica en cada arranque. `enp5s0` es también el nombre de la conexión (se ve con `nmcli -t -f NAME,DEVICE connection show`).
+- El último comando debe responder `magic`. Después de un reinicio, `ethtool` debe seguir mostrando `Wake-on: g`.
+
+**Paso 3: BIOS (pendiente).** La placa corta la corriente de la tarjeta PCI al apagarse, salvo que la BIOS lo permita. Con un monitor conectado, entra con `Supr` al encender, ve a Advanced → APM y pon `Power On By PCI Devices` (a veces llamado PCIE) en Enabled. Si existe `ErP Ready`, déjalo en Disabled, porque corta la corriente de reposo. Guarda con `F10`. Se revisará en el próximo apagado.
+
+**Paso 4: la aplicación en el celular.** En Android (vivo Y33s) se eligió *Wake On Lan* del desarrollador MR-Webb, de Google Play. En su ficha, el desarrollador declara que no comparte datos con terceros; pesa 3,8 MB, tiene más de 1 millón de descargas y 3,9 estrellas. Se descartó *WoLOn*, que tiene mejor nota (4,7) pero declara compartir con terceros el identificador del dispositivo, los registros de fallas y la actividad en la app, y ofrece compras dentro de la app. Con la regla de seguridad primero, pesa más lo que declara que la nota.
+
+Se agrega un dispositivo con estos datos (en la app, botón + y «Añadir manualmente»):
+
+| Campo en la app | Valor |
+| --- | --- |
+| Nombre del dispositivo | El que quieras, por ejemplo `srv-lab` |
+| Dirección MAC | `00:14:d1:xx:xx:xx` (la de la tarjeta TRENDnet) |
+| Hostname/IP/Dirección Broadcast | `192.168.1.255` |
+| IP del dispositivo | `192.168.1.37` (sirve para que la app muestre si está encendido) |
+| Puerto | `9` |
+| Contraseña SecureOn | Vacía; la tarjeta no la usa |
+| Red WiFi | El nombre de tu WiFi de casa |
+| Comprobación de ping y NetBIOS | Enabled |
+
+En el escaneo de red, la app muestra «Dirección MAC no encontrada» para casi todos los equipos. Es normal: Android reciente no deja leer la MAC de otros equipos. Por eso se escribe a mano.
+
+**Paso 5: probar.** El celular debe estar en el WiFi de casa, no en datos móviles, y el servidor ya apagado (por ejemplo, después de las 23:30). Toca el botón de despertar de la app, espera 1 o 2 minutos y comprueba con `ping 192.168.1.37 -t` desde el portátil o mirando el punto de estado de la app: verde es encendido, rojo es apagado.
+
+Resultado del 15 de octubre de 2026 (23:34): el servidor no se encendió y la app lo mostró en rojo. La causa más probable es la BIOS del paso 3, que aún no se revisa. Cuando se resuelva, se anotará aquí el resultado.
+
+**Controlar el servidor desde el celular:**
+
+- Apagarlo: abre Cockpit (`https://192.168.1.37:9090`) en el navegador del celular, con el celular en el WiFi de casa, y usa el botón de reinicio de arriba a la derecha → Apagar. Recuerda que un apagado así no programa la alarma de las 06:00.
+- Encenderlo: con la alarma de las 06:00, con Wake-on-LAN (cuando la BIOS lo permita) o con el botón físico.
+
+Problemas frecuentes:
+
+- La app no enciende el servidor: confirma que `Wake-on` es `g`, que el celular está en el WiFi de casa, que la MAC y la dirección `192.168.1.255` están bien escritas y, si todo eso está bien, la BIOS (paso 3).
+- Tras reiniciar, `Wake-on` vuelve a `d`: revisa que `nmcli -g 802-3-ethernet.wake-on-lan connection show enp5s0` diga `magic` y reactiva la conexión con `sudo nmcli connection up enp5s0`; la sesión SSH se corta unos segundos.
+- El escaneo de la app no encuentra la MAC: es normal en Android reciente; escríbela a mano.
 
 ## Gestión de contraseñas y secretos
 
@@ -801,12 +1358,18 @@ Pendientes inmediatos:
 - [x] Crear un usuario administrador propio en GLPI, comprobarlo y desactivar `glpi`, `tech`, `normal` y `post-only`.
 - [x] Hacer la primera copia de seguridad, probar la restauración de la base de datos y copiar los archivos al portátil.
 - [x] Reservar la IP `192.168.1.37` en el router para la MAC `00:14:d1:xx:xx:xx`.
-- [ ] Probar la restauración del volumen de archivos de GLPI (con la clave de cifrado) en un volumen de prueba.
-- [ ] Automatizar la copia de seguridad con un temporizador de systemd.
-- [ ] Crear los repositorios de GitHub (documentación pública y privado para lo funcional) y subir la documentación.
-- [ ] Activar `Power On By PCI` en la BIOS (Wake on LAN con la tarjeta PCI).
+- [x] Probar la restauración del volumen de archivos de GLPI (con la clave de cifrado) en un volumen de prueba (hecho el 17 de octubre de 2026).
+- [x] Automatizar la copia de seguridad con un temporizador de systemd (hecho el 15 de octubre de 2026: todos los días a las 23:00, con 14 días de copias).
+- [x] Crear los repositorios de GitHub (documentación pública y privado para lo funcional) y subir la documentación y los archivos Quadlet (hecho el 15 de octubre de 2026).
+- [ ] Activar `Power On By PCI` en la BIOS (Wake on LAN con la tarjeta PCI). La primera prueba desde el celular falló el 15 de octubre de 2026; se revisará en el próximo apagado.
 - [ ] Probar otro cable o puerto para subir de 100 Mb/s a 1 Gb/s.
 - [ ] Gestor de contraseñas: configurarlo con verificación en dos pasos y guardar las entradas del laboratorio.
+
+* [x] Programar el apagado a las 23:30 y el encendido a las 06:00 con la alarma del reloj de la placa (hecho el 15 de octubre de 2026).
+* [ ] Guardar una copia de las copias de seguridad fuera del servidor (en el portátil o en un disco externo), con cifrado, porque hoy todas están en el mismo SSD.
+* [ ] Vincular GitHub con Claude, dando acceso solo al repositorio `srv-lab-docs`, para publicar la guía saneada cada vez que avancemos. El saneamiento y la revisión de datos sensibles ya están preparados.
+
+- [ ] Comprar un módulo de 8 GB DDR3 de 1333 MT/s y 1,5 V, probarlo con memtest86+ e instalarlo en la ranura DIMM1.
 
 Siguientes fases:
 
