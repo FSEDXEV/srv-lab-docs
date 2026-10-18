@@ -1410,6 +1410,71 @@ Contexto: el escaneo automático de skills existe solo en organizaciones Enterpr
 
 **Postulaciones y cursos.** La IA puede analizar una oferta, señalar qué te falta y proponer cómo adaptar tu hoja de vida, y priorizar tus cursos según las brechas detectadas. Revisa siempre el texto final antes de enviarlo y no incluyas datos personales sensibles en planes gratuitos. Para priorizar cursos falta la lista (ver pendientes).
 
+## Multi-IA para la búsqueda de empleo: diseño y bot de Telegram (17 de octubre de 2026)
+
+Estado: **diseño definido, bot creado y token guardado; todavía no se instaló nada en el servidor** porque tiene 4 GB de RAM. La regla del sistema es que la IA prepara y tú apruebas: evalúa ofertas, adapta la hoja de vida y avisa, pero cada postulación la envías tú.
+
+**Por qué no postula sola.** Muchos portales, entre ellos LinkedIn, restringen la automatización en sus condiciones de uso (verifica las de cada uno), y una cuenta bloqueada o un dato equivocado enviado a muchas empresas no se corrige. Con aprobación manual se conserva la calidad y se reduce el riesgo.
+
+**Revisión del router v2 (zip).** Se leyó sin ejecutar nada, en una carpeta aislada. No contiene claves; las toma de `.env`, que Git ignora. Hallazgo de seguridad: `requirements.txt` pide `litellm>=1.50.0`, sin versión fija, y ese rango admite las versiones 1.82.7 y 1.82.8, que según lo investigado se comprometieron en marzo de 2026. Antes de instalarlo hay que fijar una versión exacta y revisada (`litellm==X.Y.Z`). Tampoco trae tareas programadas, lector de correo ni alertas: hoy solo responde cuando se le escribe.
+
+| Pieza | Qué hace | Estado |
+| --- | --- | --- |
+| Lector de correo | Lee en solo lectura los correos de alertas de empleo y extrae los enlaces (API de Gmail) | Pendiente |
+| Evaluador (router) | Puntúa cada oferta de 0 a 100, indica qué falta y elige el perfil de hoja de vida | Pendiente |
+| Lista web | Página en el servidor, solo desde la red local o Tailscale y con usuario y contraseña; botones Postulé, Descartar y Seguimiento | Pendiente |
+| Bot de Telegram | Envía avisos de ofertas, respuestas, seguimientos y alertas de estudio | Creado; falta el programa que lo atienda |
+| Seguimiento | Recuerda escribir a los 5 días sin respuesta y propone cursos para cerrar brechas | Pendiente |
+
+**Fuentes de ofertas.** Los correos de algunos portales traen solo el listado y los enlaces, sin el detalle. El sistema abrirá los enlaces públicos con pocas consultas; si un portal los bloquea, la lista web pedirá pegar el texto de la oferta. Un portal que solo funciona con sesión iniciada no se automatiza: el texto se pega a mano. No se guardan en el servidor las claves de ningún portal de empleo.
+
+**Filtros y datos personales.** La zona, la modalidad (presencial, híbrida o remota) y el salario mínimo se configuran en un archivo local que no se publica. Una oferta por debajo del mínimo no se descarta: se marca y queda al final. Las hojas de vida son datos personales y no se suben a GitHub.
+
+**Reglas de seguridad del bot.**
+
+- El token del bot es una contraseña: solo vive en el servidor, nunca se pega en chats ni aparece en capturas.
+- Telegram no cifra los mensajes de extremo a extremo; por el bot solo viajan títulos, puntajes y enlaces, nunca la hoja de vida ni datos personales.
+- El bot responderá únicamente al identificador de chat autorizado e ignorará a cualquier otra cuenta.
+- Las claves de las IAs también viven solo en el servidor; el navegador y la página web no las ven.
+
+**Paso 1: crear el bot** (en Telegram, desde el celular). Abre un chat con `@BotFather`, escribe `/newbot`, elige un nombre para mostrar y un nombre de usuario único que termine en `bot`. BotFather entrega un token (números, dos puntos y letras): trátalo como una contraseña.
+
+**Paso 2: si el token se muestra por error, revócalo.** El 17 de octubre de 2026 el token apareció completo en una captura de pantalla. Se corrigió escribiendo `/revoke` en BotFather, eligiendo el bot y guardando el token nuevo: el anterior deja de funcionar al instante. En adelante se recortan o tapan las capturas antes de enviarlas.
+
+**Paso 3: guardar el token en el servidor** (como `fabian`, por `ssh srv-lab`, ejecutando cada bloque por separado). Primero una carpeta que solo tu usuario puede abrir:
+
+```bash
+mkdir -p ~/.config/srv-lab && chmod 700 ~/.config/srv-lab
+```
+
+Luego se lee el token con la entrada oculta (`-s`), para que no se vea en pantalla ni quede en el historial de comandos. Se pega el token y se pulsa Enter:
+
+```bash
+read -rsp "Pega el token y pulsa Enter: " T; echo
+```
+
+Por último se escribe en un archivo protegido y se borra la variable:
+
+```bash
+umask 077; printf 'TELEGRAM_BOT_TOKEN=%s\n' "$T" > ~/.config/srv-lab/telegram.env; unset T
+wc -c ~/.config/srv-lab/telegram.env
+```
+
+- `umask 077` hace que el archivo nazca con permisos `-rw-------`; con `ls -l` debe verse así y con dueño `fabian`.
+- `wc -c` cuenta los bytes: con un token completo da unos 66; si da **20**, el token quedó vacío (solo está el texto `TELEGRAM_BOT_TOKEN=` y el salto de línea).
+- No abras el archivo con `cat` ni lo muestres en capturas.
+- El archivo está fuera de cualquier repositorio, así que Git no puede subirlo por accidente.
+
+Resultado del 17 de octubre de 2026: a la primera el archivo salió de 20 bytes porque el comando de lectura se ejecutó junto con el siguiente y no recibió el token; al repetir cada bloque por separado salió de 66 bytes. Después de escribir `/start` al bot, el chat queda registrado.
+
+**Orden de construcción** (bloques de una a dos horas, con el servidor encendido entre las 6:00 a. m. y las 11:30 p. m.): 1) hojas de vida por perfil (hecho, sin servidor); 2) el programa que atiende al bot y la lista de chats autorizados; 3) lista web y evaluador, primero con ofertas pegadas a mano; 4) lector de correo con la API de Gmail en solo lectura; 5) seguimiento y alertas de estudio. El lector de correo y las consultas corren de día, porque el servidor está apagado de 11:30 p. m. a 6:00 a. m. y los avisos pueden llegar con retraso.
+
+Problemas posibles:
+
+- *`wc -c` da 20 bytes:* el token no entró; repite el Paso 3 con cada bloque por separado.
+- *El token apareció en una captura o en un chat:* `/revoke` en BotFather y token nuevo.
+- *El bot no responde al `/start`:* es normal hasta que exista el programa que lo atienda.
+
 ## Pendientes, próximos pasos y datos por completar
 
 La primera etapa está casi cerrada: GLPI ya tiene usuario propio y la copia de la base de datos se restauró con éxito; faltan automatizar las copias, versionar la documentación y el resto de pendientes, por fases según la RAM disponible.
@@ -1435,6 +1500,11 @@ Pendientes inmediatos:
 * [ ] Confirmar que la copia de las 11:00 p. m. del 17 de octubre aparece en `/srv/backups/glpi` y, después, borrar la carpeta vieja `~/backups/glpi` del SSD.
 * [ ] Repetir la prueba de restauración usando las copias del disco nuevo.
 * [ ] Revisar en solo lectura qué hay en la partición `DATOS` (762,8 GB) y decidir qué se rescata y a dónde.
+
+- [ ] Probar el token del bot (consulta `getMe`), registrar el chat autorizado y enviar un mensaje de prueba al celular.
+- [ ] Fijar una versión exacta y revisada de `litellm` en el `requirements.txt` del router antes de instalarlo.
+- [ ] Crear el proyecto gratuito de Google Cloud con la API de Gmail en solo lectura para el lector de correo.
+- [ ] Construir la lista web de ofertas y el evaluador, primero con ofertas pegadas a mano.
 
 Siguientes fases:
 
