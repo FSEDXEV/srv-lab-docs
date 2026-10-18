@@ -801,7 +801,66 @@ Para los servicios de usuario también sirve `journalctl _SYSTEMD_USER_UNIT=glpi
 
 **Seguridad de las copias.** El `.tar` contiene `config/glpicrypt.key`, `config/config_db.php` (datos de conexión a la base de datos) y las llaves `oauth.pem` y `oauth.pub`. Mantén los permisos en 600, no las subas a Git (el `.gitignore` lo evita) y, si las sacas de casa, que sea cifradas.
 
-**Límite actual.** Todas las copias están en el mismo SSD que el servidor: protegen contra un borrado o una actualización fallida, pero no contra la falla del disco. Sacarlas a otro equipo sigue siendo manual (bloque anterior) y está en la lista de pendientes.
+**Límite actual.** Desde el 17 de octubre de 2026 las copias se guardan en un disco aparte (bloque siguiente): protegen contra la falla del SSD, pero siguen dentro del mismo equipo, así que no protegen contra un incendio, un robo o una sobretensión. Una copia cifrada fuera del servidor sigue en la lista de pendientes.
+
+**Copias en un disco aparte (hecho el 17 de octubre de 2026).** El servidor tiene un disco mecánico WD de 1 TB (`sdb`) con cuatro particiones NTFS de un Windows anterior: una reservada del sistema, una de 160,9 GB, `DATOS` (762,8 GB) y `Camara` (7,2 GB). Solo se formateó `sdb4` (`Camara`); `DATOS` y las otras quedaron intactas y sin montar. Las copias ocupan poco (17 MB en cuatro días, unos 60 MB en los 14 días que se conservan), así que 7,2 GB sobran.
+
+**Paso 1: confirmar el objetivo** (solo lee). Debe mostrar `sdb4`, `7.2G`, `Camara` y ningún punto de montaje.
+
+```
+lsblk -o NAME,SIZE,LABEL,MOUNTPOINTS /dev/sdb4
+```
+
+**Paso 2: formatear solo `sdb4`** (borra su contenido para siempre). `-f` es necesario porque ya tenía NTFS; `-L backups` le pone nombre.
+
+```
+sudo mkfs.xfs -f -L backups /dev/sdb4
+```
+
+**Paso 3: montarlo y dejarlo fijo al reiniciar.** Se usa el UUID (el identificador único de la partición) porque `sdb4` puede cambiar de nombre entre arranques.
+
+```
+sudo mkdir -p /srv/backups
+UUID=$(sudo blkid -s UUID -o value /dev/sdb4)
+echo "UUID=$UUID /srv/backups xfs defaults,nofail,x-systemd.device-timeout=10s 0 0" | sudo tee -a /etc/fstab
+sudo systemctl daemon-reload
+sudo mount -a
+sudo chown fabian:fabian /srv/backups
+chmod 700 /srv/backups
+df -h /srv/backups
+```
+
+- `nofail` hace que el servidor arranque aunque el disco falle; `x-systemd.device-timeout=10s` evita esperar más de 10 segundos.
+- `mount -a` prueba la línea de `/etc/fstab` ahora; un error aparece aquí y no al reiniciar.
+- Resultado: 7,2 GB de tamaño, 84 MB usados por la estructura del sistema de archivos.
+
+**Paso 4: pasar las copias y cambiar el script.** Las copias viejas se quedan en `~/backups/glpi` hasta confirmar que todo funciona.
+
+```
+cp -a ~/backups/glpi /srv/backups/
+sed -i 's|^DEST="\$HOME/backups/glpi"|DEST="/srv/backups/glpi"|' ~/bin/backup-glpi.sh
+sed -i '/^umask 077/a mountpoint -q /srv/backups || { echo "ERROR: el disco de copias no esta montado"; exit 1; }' ~/bin/backup-glpi.sh
+sed -i 's|Guarda en ~/backups/glpi|Guarda en /srv/backups/glpi|' ~/bin/backup-glpi.sh
+grep -n 'DEST=\|mountpoint\|Guarda' ~/bin/backup-glpi.sh
+```
+
+- `sed -i` edita el archivo en su sitio. El segundo comando inserta una comprobación después de `umask 077`: si el disco no está montado, el script se detiene en vez de llenar el SSD en silencio.
+- El `grep` debe mostrar el comentario con la ruta nueva, la línea `mountpoint -q ...` y `DEST="/srv/backups/glpi"`.
+
+**Paso 5: probar una copia manual.**
+
+```
+~/bin/backup-glpi.sh
+ls -lh /srv/backups/glpi
+```
+
+Resultado: «Copia 2026-10-17 correcta» y los archivos de los días 14 al 17 en el disco nuevo. El temporizador de las 11:00 p. m. usa este mismo script, así que desde esa noche guarda allí.
+
+**Problemas posibles.**
+
+- *El script dice «ERROR: el disco de copias no esta montado»:* revisa con `lsblk` que el disco esté conectado y corre `sudo mount -a`.
+- *El servidor tarda en arrancar:* revisa que la línea de `/etc/fstab` tenga `nofail` y el tiempo de espera.
+- *`mkfs.xfs` se niega a formatear:* falta `-f`; verifica antes con el Paso 1 que el dispositivo sea el correcto.
 
 **Sacar la copia del servidor** (desde el portátil, PowerShell):
 
@@ -1020,6 +1079,8 @@ id_*
 backups/
 "@ | Set-Content .gitignore
 ```
+
+**Publicación automática (17 de octubre de 2026).** Con GitHub vinculado a Claude (Ajustes, Conectores) y la aplicación instalada solo en el repositorio `srv-lab-docs`, Claude publica la guía después de cada avance. El proceso es siempre el mismo: exportar la guía, aplicar el saneamiento, correr la revisión de fugas (si encuentra algo grave, no se publica), copiar el archivo a `docs/guia-laboratorio.md`, hacer el commit y subirlo. Solo se publica la versión saneada; el repositorio `srv-lab-privado` no se toca sin que lo pidas.
 
 **Paso 9: preparar el contenido.** Antes de publicar algo en el repositorio público se revisa buscando datos sensibles. En la copia pública de esta guía se aplicaron estos cambios:
 
@@ -1367,9 +1428,13 @@ Pendientes inmediatos:
 
 * [x] Programar el apagado a las 23:30 y el encendido a las 06:00 con la alarma del reloj de la placa (hecho el 15 de octubre de 2026).
 * [ ] Guardar una copia de las copias de seguridad fuera del servidor (en el portátil o en un disco externo), con cifrado, porque hoy todas están en el mismo SSD.
-* [ ] Vincular GitHub con Claude, dando acceso solo al repositorio `srv-lab-docs`, para publicar la guía saneada cada vez que avancemos. El saneamiento y la revisión de datos sensibles ya están preparados.
+* [x] Vincular GitHub con Claude, dando acceso solo al repositorio `srv-lab-docs` (hecho el 17 de octubre de 2026). La guía saneada ya se publicó; en adelante se publica después de cada avance.
 
 - [ ] Comprar un módulo de 8 GB DDR3 de 1333 MT/s y 1,5 V, probarlo con memtest86+ e instalarlo en la ranura DIMM1.
+
+* [ ] Confirmar que la copia de las 11:00 p. m. del 17 de octubre aparece en `/srv/backups/glpi` y, después, borrar la carpeta vieja `~/backups/glpi` del SSD.
+* [ ] Repetir la prueba de restauración usando las copias del disco nuevo.
+* [ ] Revisar en solo lectura qué hay en la partición `DATOS` (762,8 GB) y decidir qué se rescata y a dónde.
 
 Siguientes fases:
 
